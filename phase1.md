@@ -23,18 +23,10 @@ A high-level overview of how the components will interact.
 
 Note each task has a clear `Definition of Done`.
 
----
-
-**Task 1: Foundational Setup** into a detailed, step-by-step guide with the exact commands and code you'll need.
-
-Executing Task 1 correctly ensures a clean, organized, and reproducible development environment.
-
----
-
 ### **Task 1: Foundational Setup — Step-by-Step Implementation**
 
 **Objective:** To establish the project's version control, directory structure, isolated Python environment, dependencies, and database schema.
-
+Executing Task 1 correctly ensures a clean, organized, and reproducible development environment.
 ---
 
 #### **Step 1.1: Initialize the Git Repository**
