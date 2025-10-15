@@ -588,7 +588,7 @@ Task 3 completion when:
     *   The `insert_job_listing` function successfully saves a new record to the database.
     *   The Streamlit app provides clear feedback (`st.success` for new records, `st.warning` for duplicates).
 
-**4. Testing Strategy**
+**Task 5: Testing Strategy**
 
 *   **Unit Tests:** Use a framework like `pytest` to test individual functions in isolation.
     *   Test the `hash_description` function with known inputs.
