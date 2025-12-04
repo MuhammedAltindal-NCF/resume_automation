@@ -10,8 +10,9 @@ from contextlib import contextmanager
 
 from dotenv import load_dotenv
 
-# Import shared data structure
-from models import JobListing
+# Import shared data structures
+from models import JobListing, Resume, AnalysisResult
+import json
 
 # Load environment variables
 load_dotenv()
@@ -26,8 +27,15 @@ except ImportError:
     print("Warning: psycopg2 not available. Database functions will not work.")
 
 
+def reload_env():
+    """Reload environment variables from .env file."""
+    load_dotenv(override=True)
+
+
 def _get_db_config() -> Dict[str, str]:
     """Get database configuration from environment variables."""
+    # Always reload to get latest values
+    load_dotenv(override=True)
     return {
         'dbname': os.getenv('DB_NAME', 'resume_optimizer'),
         'user': os.getenv('DB_USER', 'postgres'),
@@ -219,3 +227,388 @@ def test_connection() -> bool:
                 return True
     except Exception:
         return False
+
+
+def check_tables_exist() -> dict:
+    """
+    Check which required tables exist in the database.
+
+    Returns:
+        Dictionary with table names as keys and existence status as values.
+    """
+    tables = {
+        'job_listings': False,
+        'resumes': False,
+        'analysis_results': False
+    }
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_name IN ('job_listings', 'resumes', 'analysis_results');
+                """)
+                existing = {row[0] for row in cur.fetchall()}
+                for table in tables:
+                    tables[table] = table in existing
+    except Exception:
+        pass
+    return tables
+
+
+def tables_ready() -> bool:
+    """
+    Check if all required tables exist.
+
+    Returns:
+        True if all tables exist, False otherwise.
+    """
+    tables = check_tables_exist()
+    return all(tables.values())
+
+
+# =============================================================================
+# Resume Database Operations (Phase 2)
+# =============================================================================
+
+def insert_resume(resume: Resume, file_hash: str) -> Optional[int]:
+    """
+    Insert a new resume record into the database.
+
+    Args:
+        resume: The Resume object containing the parsed data.
+        file_hash: SHA-256 hash of the resume file for deduplication.
+
+    Returns:
+        The ID of the inserted resume, or None if insertion failed.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO resumes
+                    (full_name, email, phone, location, summary, skills,
+                     experience, education, projects, raw_text, file_hash, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                """
+                values = (
+                    resume.full_name,
+                    resume.email,
+                    resume.phone,
+                    resume.location,
+                    resume.summary,
+                    json.dumps(resume.skills),
+                    json.dumps(resume.experience),
+                    json.dumps(resume.education),
+                    json.dumps(resume.projects),
+                    resume.raw_text,
+                    file_hash,
+                    json.dumps(resume.metadata) if resume.metadata else None
+                )
+                cur.execute(sql, values)
+                resume_id = cur.fetchone()[0]
+                conn.commit()
+                return resume_id
+    except Exception as e:
+        print(f"Database insert failed: {e}")
+        return None
+
+
+def get_resume_by_id(resume_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a resume by its ID.
+
+    Args:
+        resume_id: The database ID of the resume.
+
+    Returns:
+        A dictionary containing the resume data, or None if not found.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT id, full_name, email, phone, location, summary,
+                           skills, experience, education, projects, raw_text,
+                           file_hash, metadata, created_at, updated_at
+                    FROM resumes
+                    WHERE id = %s;
+                """
+                cur.execute(sql, (resume_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        print(f"Error fetching resume: {e}")
+        return None
+
+
+def get_resume_by_hash(file_hash: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a resume by its file hash.
+
+    Args:
+        file_hash: The SHA-256 hash of the resume file.
+
+    Returns:
+        A dictionary containing the resume data, or None if not found.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT id, full_name, email, phone, location, summary,
+                           skills, experience, education, projects, raw_text,
+                           file_hash, metadata, created_at, updated_at
+                    FROM resumes
+                    WHERE file_hash = %s;
+                """
+                cur.execute(sql, (file_hash,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        print(f"Error fetching resume by hash: {e}")
+        return None
+
+
+def get_all_resumes(limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Retrieve all resumes from the database.
+
+    Args:
+        limit: Maximum number of records to return.
+
+    Returns:
+        A list of dictionaries containing resume data.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT id, full_name, email, phone, location,
+                           skills, created_at, updated_at
+                    FROM resumes
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                """
+                cur.execute(sql, (limit,))
+                return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error fetching resumes: {e}")
+        return []
+
+
+def delete_resume(resume_id: int) -> bool:
+    """
+    Delete a resume by its ID.
+
+    Args:
+        resume_id: The database ID of the resume to delete.
+
+    Returns:
+        True if deletion was successful, False otherwise.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                sql = "DELETE FROM resumes WHERE id = %s;"
+                cur.execute(sql, (resume_id,))
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        print(f"Error deleting resume: {e}")
+        return False
+
+
+def update_resume(resume_id: int, resume: Resume) -> bool:
+    """
+    Update an existing resume record.
+
+    Args:
+        resume_id: The database ID of the resume to update.
+        resume: The Resume object containing the updated data.
+
+    Returns:
+        True if update was successful, False otherwise.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                sql = """
+                    UPDATE resumes
+                    SET full_name = %s, email = %s, phone = %s, location = %s,
+                        summary = %s, skills = %s, experience = %s, education = %s,
+                        raw_text = %s, metadata = %s
+                    WHERE id = %s;
+                """
+                values = (
+                    resume.full_name,
+                    resume.email,
+                    resume.phone,
+                    resume.location,
+                    resume.summary,
+                    json.dumps(resume.skills),
+                    json.dumps(resume.experience),
+                    json.dumps(resume.education),
+                    resume.raw_text,
+                    json.dumps(resume.metadata) if resume.metadata else None,
+                    resume_id
+                )
+                cur.execute(sql, values)
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        print(f"Error updating resume: {e}")
+        return False
+
+
+# =============================================================================
+# Analysis Results Database Operations (Phase 2)
+# =============================================================================
+
+def insert_analysis_result(
+    resume_id: int,
+    job_id: int,
+    match_score: float,
+    matching_skills: List[str],
+    missing_skills: List[str],
+    keyword_suggestions: List[str],
+    improvement_suggestions: List[str],
+    metadata: Optional[Dict[str, Any]] = None
+) -> Optional[int]:
+    """
+    Insert a new analysis result into the database.
+
+    Args:
+        resume_id: The ID of the resume being analyzed.
+        job_id: The ID of the job listing compared against.
+        match_score: The calculated match score (0-100).
+        matching_skills: List of skills that match.
+        missing_skills: List of skills missing from the resume.
+        keyword_suggestions: List of suggested keywords to add.
+        improvement_suggestions: List of improvement suggestions.
+        metadata: Additional analysis metadata.
+
+    Returns:
+        The ID of the inserted analysis result, or None if insertion failed.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO analysis_results
+                    (resume_id, job_listing_id, match_score, matching_skills,
+                     missing_skills, keyword_suggestions, improvement_suggestions,
+                     analysis_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (resume_id, job_listing_id)
+                    DO UPDATE SET
+                        match_score = EXCLUDED.match_score,
+                        matching_skills = EXCLUDED.matching_skills,
+                        missing_skills = EXCLUDED.missing_skills,
+                        keyword_suggestions = EXCLUDED.keyword_suggestions,
+                        improvement_suggestions = EXCLUDED.improvement_suggestions,
+                        analysis_metadata = EXCLUDED.analysis_metadata,
+                        created_at = NOW()
+                    RETURNING id;
+                """
+                values = (
+                    resume_id,
+                    job_id,
+                    match_score,
+                    json.dumps(matching_skills),
+                    json.dumps(missing_skills),
+                    json.dumps(keyword_suggestions),
+                    json.dumps(improvement_suggestions),
+                    json.dumps(metadata) if metadata else None
+                )
+                cur.execute(sql, values)
+                result_id = cur.fetchone()[0]
+                conn.commit()
+                return result_id
+    except Exception as e:
+        print(f"Error inserting analysis result: {e}")
+        return None
+
+
+def get_analysis_for_resume(resume_id: int) -> List[Dict[str, Any]]:
+    """
+    Get all analysis results for a specific resume.
+
+    Args:
+        resume_id: The ID of the resume.
+
+    Returns:
+        A list of analysis result dictionaries.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT ar.*, jl.job_title, jl.company
+                    FROM analysis_results ar
+                    JOIN job_listings jl ON ar.job_listing_id = jl.id
+                    WHERE ar.resume_id = %s
+                    ORDER BY ar.created_at DESC;
+                """
+                cur.execute(sql, (resume_id,))
+                return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error fetching analysis results: {e}")
+        return []
+
+
+def get_analysis_for_job(job_id: int) -> List[Dict[str, Any]]:
+    """
+    Get all analysis results for a specific job listing.
+
+    Args:
+        job_id: The ID of the job listing.
+
+    Returns:
+        A list of analysis result dictionaries.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT ar.*, r.full_name, r.email
+                    FROM analysis_results ar
+                    JOIN resumes r ON ar.resume_id = r.id
+                    WHERE ar.job_listing_id = %s
+                    ORDER BY ar.match_score DESC;
+                """
+                cur.execute(sql, (job_id,))
+                return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error fetching analysis results: {e}")
+        return []
+
+
+def get_analysis_by_ids(resume_id: int, job_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Get a specific analysis result by resume and job IDs.
+
+    Args:
+        resume_id: The ID of the resume.
+        job_id: The ID of the job listing.
+
+    Returns:
+        The analysis result dictionary, or None if not found.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                sql = """
+                    SELECT *
+                    FROM analysis_results
+                    WHERE resume_id = %s AND job_listing_id = %s;
+                """
+                cur.execute(sql, (resume_id, job_id))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        print(f"Error fetching analysis result: {e}")
+        return None
