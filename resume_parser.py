@@ -223,13 +223,23 @@ def parse_resume(file_bytes: bytes, file_type: str) -> str:
 
 
 def clean_resume_text(text: str) -> str:
-    """Clean and normalize resume text."""
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Preserve line breaks for section detection
-    text = re.sub(r'([.!?])\s+', r'\1\n', text)
-    # Remove excessive newlines
+    """
+    Clean and normalize resume text **while preserving line breaks**.
+    This is important so that sections like EDUCATION contain separate
+    blocks for each school / degree.
+    """
+    # Normalize line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # Collapse spaces/tabs but KEEP newlines
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    # Remove trailing spaces before newline
+    text = re.sub(r' ?\n', '\n', text)
+
+    # Collapse 3+ blank lines into max 2
     text = re.sub(r'\n{3,}', '\n\n', text)
+
     return text.strip()
 
 
@@ -266,6 +276,68 @@ def extract_name_with_spacy(text: str) -> Optional[str]:
         if ent.label_ == 'PERSON':
             return ent.text
     return None
+
+def extract_name_heuristic(text: str) -> Optional[str]:
+    """
+    Fallback name extractor when spaCy fails.
+
+    Strategy:
+    - Look only at the first few non-empty lines.
+    - Prefer a two-word ALL-CAPS token at the very beginning
+      (e.g. 'HARPER RUSSO').
+    - Otherwise look for 2–4 capitalized tokens that don't look
+      like an address or job title line.
+    """
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return None
+
+    header = lines[:7]
+
+    forbidden_address = {
+        "street", "st", "ave", "road", "rd", "suite", "address",
+        "city", "zip", "phone", "email", "contact"
+    }
+    forbidden_titles = {
+        "manager", "engineer", "developer", "analyst", "consultant",
+        "director", "specialist", "coordinator", "intern",
+        "operations", "business", "marketing", "sales", "assistant"
+    }
+
+    # 1) FULL-CAPS name at start of line, possibly followed by other text
+    #    matches 'HARPER RUSSO' in 'HARPER RUSSO  +123-456-7890 ...'
+    caps_name_pattern = re.compile(r'^([A-Z]{2,}(?:\s+[A-Z]{2,}){1,2})\b')
+
+    for line in header:
+        m = caps_name_pattern.match(line)
+        if m:
+            tokens = m.group(1).split()
+            if 1 < len(tokens) <= 3:
+                return " ".join(t.capitalize() for t in tokens)
+
+    # 2) Normal title-case name candidate
+    for line in header:
+        lowered = line.lower()
+
+        # Skip address/contact and job-title lines
+        if any(w in lowered for w in forbidden_address):
+            continue
+        if any(w in lowered for w in forbidden_titles):
+            continue
+        if any(ch.isdigit() for ch in line):
+            continue
+
+        parts = line.split()
+        if 2 <= len(parts) <= 4 and all(p[0].isalpha() for p in parts):
+            # Require that most tokens start with uppercase
+            if sum(1 for p in parts if p[0].isupper()) >= len(parts) - 1:
+                # Some lines may have a tagline; keep only first 2–3 tokens
+                return " ".join(parts[:3])
+
+    return None
+
+
 
 
 def extract_location_with_spacy(text: str) -> Optional[str]:
@@ -503,133 +575,127 @@ def extract_education(text: str) -> List[Dict[str, Any]]:
     """
     Extract education entries from resume text.
 
-    Returns:
-        List of education dictionaries with keys:
-        - institution: School/University name
-        - degree: Degree type (BS, MS, PhD, etc.)
-        - field: Field of study
-        - dates: Graduation date or date range
-        - gpa: GPA if present
+    Strategy:
+    1. Prefer the text inside the EDUCATION section if it exists.
+    2. First try to find universities/colleges with regex.
+    3. If nothing is found (e.g. 'Warner & Spencer'), fall back to splitting
+       the education section into blocks separated by blank lines.
     """
+
     sections = find_section_boundaries(text)
 
-    if 'education' not in sections:
-        return []
-
-    start, end = sections['education']
-    education_text = text[start:end]
-
-    educations = []
-
-    # University/College pattern - include well-known universities and common patterns
-    # This pattern handles "X University", "University of X", "X State University", and known names
-    university_pattern = re.compile(
-        r'\b((?:Oregon State|Northeastern|Stanford|MIT|Harvard|Yale|Berkeley|UCLA|USC|NYU|'
-        r'Columbia|Cornell|Princeton|Duke|Northwestern|Carnegie Mellon|Georgia Tech|'
-        r'Boston|Michigan|Texas|Penn State|Ohio State|Florida State|Arizona State|'
-        r'Washington|Virginia|Illinois|Wisconsin|Minnesota|Purdue|Maryland|'
-        r'Rutgers|Indiana|Iowa State|Colorado|Tennessee|Kentucky|Alabama|LSU|'
-        r'Notre Dame|Georgetown|Brown|Dartmouth|Vanderbilt|Rice|Emory)\s+'
-        r'(?:University|College|Institute)|'
-        r'University\s+of\s+[A-Z][a-z]+(?:\s+[A-Za-z]+)*|'
-        r'[A-Z][a-z]+\s+State\s+University|'
-        r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:College|Institute|Technical Institute))\b',
-        re.IGNORECASE
-    )
-
-    # Simpler fallback pattern
-    simple_uni_pattern = re.compile(
-        r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+University)\b'
-    )
-
-    # Degree patterns - expanded to catch more formats
-    # Be careful not to match state abbreviations like MA, OR, etc.
-    degree_pattern = re.compile(
-        r'(Bachelor(?:\s+of\s+(?:Science|Arts))?|Master(?:\s+of\s+(?:Science|Arts))?|'
-        r'B\.S\.?|B\.A\.?|M\.S\.?|M\.A\.|Ph\.?D\.?|MBA|Associate|'
-        r'Postbaccalaureate|Doctorate)',
-        re.IGNORECASE
-    )
-
-    # Field of study - follows "in" after degree
-    field_pattern = re.compile(
-        r'(?:Bachelor|Master|B\.?S\.?|B\.?A\.?|M\.?S\.?|M\.?A\.?)\s+(?:of\s+\w+\s+)?in\s+([A-Za-z\s]+?)(?:\s*[\|,\(]|$)',
-        re.IGNORECASE
-    )
-
-    # GPA pattern
-    gpa_pattern = re.compile(r'GPA[:\s]*([0-4]\.[0-9]{1,2})', re.IGNORECASE)
-
-    # Date pattern for education (month year or just year)
-    edu_date_pattern = re.compile(
-        r'(?:Expected\s+)?(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
-        r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|'
-        r'\b\d{4}\b',
-        re.IGNORECASE
-    )
-
-    # Find all universities using both patterns
-    universities = university_pattern.findall(education_text)
-    if not universities:
-        universities = simple_uni_pattern.findall(education_text)
-
-    # Clean up university names - remove false positives
-    exclude_words = {'bachelor', 'master', 'education', 'science', 'arts', 'engineering',
-                    'computer', 'data', 'business', 'management', 'associate', 'doctor'}
-    cleaned_universities = []
-    for u in universities:
-        u = u.strip()
-        if not u:
-            continue
-        first_word = u.split()[0].lower() if u.split() else ''
-        if first_word not in exclude_words:
-            cleaned_universities.append(u)
-    universities = cleaned_universities
-
-    if universities:
-        # Split education text by university names to get each entry
-        for i, uni in enumerate(universities):
-            uni_clean = uni.strip()
-
-            # Find the text chunk for this university
-            uni_start = education_text.find(uni)
-            if i + 1 < len(universities):
-                next_uni_start = education_text.find(universities[i + 1])
-                chunk = education_text[uni_start:next_uni_start]
-            else:
-                chunk = education_text[uni_start:]
-
-            # Extract details from this chunk
-            degree_matches = degree_pattern.findall(chunk)
-            field_matches = field_pattern.findall(chunk)
-            date_matches = edu_date_pattern.findall(chunk)
-            gpa_match = gpa_pattern.search(chunk)
-
-            entry = {
-                'institution': uni_clean,
-                'degree': degree_matches[0] if degree_matches else None,
-                'field': field_matches[0].strip() if field_matches else None,
-                'dates': date_matches[0] if date_matches else None,
-                'gpa': gpa_match.group(1) if gpa_match else None
-            }
-            educations.append(entry)
+    # ----- 1) Determine which part of the text to scan -----
+    if "education" in sections:
+        start, end = sections["education"]
+        education_text = text[start:end].strip()
     else:
-        # Fallback: try spaCy if no universities found with regex
-        if nlp:
-            doc = nlp(education_text)
-            institutions = [ent.text for ent in doc.ents if ent.label_ == 'ORG']
-            degree_matches = degree_pattern.findall(education_text)
-            gpa_match = gpa_pattern.search(education_text)
+        # No explicit EDUCATION header → scan whole text (we still try to
+        # detect education-like blocks using patterns).
+        education_text = text
+    
+    #  Fix: normalize header spacing & bullet separation
+    education_text = education_text.replace("•", "\n•")   # bullet varsa satır ayır
+    educations: List[Dict[str, Any]] = []
 
-            if institutions or degree_matches:
-                entry = {
-                    'institution': institutions[0] if institutions else None,
-                    'degree': degree_matches[0] if degree_matches else None,
-                    'field': None,
-                    'dates': None,
-                    'gpa': gpa_match.group(1) if gpa_match else None
-                }
-                educations.append(entry)
+    # ----- 2) First try: universities / colleges regex -----
+    university_pattern = re.compile(
+        r'\b([A-Z][A-Za-z.&\s-]*(University|College|Institute|Academy|School|Polytechnic))\b',
+        re.IGNORECASE
+    )
+
+    degree_pattern = re.compile(
+        r'(Bachelor|Master|MBA|Bachelors?|Masters?|Diploma|Certificate|Associate|Doctorate)',
+        re.IGNORECASE
+    )
+
+    field_pattern = re.compile(
+        r'in\s+([A-Za-z\s&]+?)(?:,|\||\.|\n|$)', re.IGNORECASE
+    )
+
+    date_pattern = re.compile(r'\b(19|20)\d{2}\b')
+    gpa_pattern = re.compile(r'GPA[:\s]*([0-4]\.\d{1,2})', re.IGNORECASE)
+
+    uni_matches = list(university_pattern.finditer(education_text))
+
+    if uni_matches:
+        # Build entries around each university match
+        for match in uni_matches:
+            chunk = education_text[match.start(): match.start() + 300]
+
+            degree = None
+            for d in degree_pattern.findall(chunk):
+                degree = d
+                break
+
+            field = None
+            for f in field_pattern.finditer(chunk):
+                field = f.group(1).strip()
+                break
+
+            date = None
+            for dt in date_pattern.finditer(chunk):
+                date = dt.group(0)
+                break
+
+            gpa = None
+            g = gpa_pattern.search(chunk)
+            if g:
+                gpa = g.group(1)
+
+            educations.append({
+                "institution": match.group(0).strip(),
+                "degree": degree,
+                "field": field,
+                "dates": date,
+                "gpa": gpa,
+            })
+
+    # ----- 3) Fallback: block-based parsing (for cases like Warner & Spencer) -----
+    if not educations:
+        # Split EDUCATION section into blocks separated by blank lines
+        # Improved splitting for stacked degrees without blank lines
+        blocks = re.split(r'\n(?=[A-Z][A-Za-z& ]+\.?,?$)', education_text.strip())  
+
+        for block in blocks:
+            lines = [l.strip() for l in block.splitlines() if l.strip()]
+            if not lines:
+                continue
+
+            # In education blocks, first line is usually institution,
+            # the rest describe degree / field.
+            institution = lines[0]
+            details = " ".join(lines[1:]) if len(lines) > 1 else ""
+
+            if not institution:
+                continue
+
+            degree = None
+            for d in degree_pattern.findall(details):
+                degree = d
+                break
+
+            field = None
+            for f in field_pattern.finditer(details):
+                field = f.group(1).strip()
+                break
+
+            date = None
+            for dt in date_pattern.finditer(details):
+                date = dt.group(0)
+                break
+
+            gpa = None
+            g = gpa_pattern.search(details)
+            if g:
+                gpa = g.group(1)
+
+            educations.append({
+                "institution": institution,
+                "degree": degree,
+                "field": field,
+                "dates": date,
+                "gpa": gpa,
+            })
 
     return educations
 
@@ -746,9 +812,16 @@ def extract_resume_details(raw_text: str) -> Resume:
     if linkedin:
         extraction_methods['regex'].append('linkedin')
 
+    # Full name: try spaCy NER first, then header-based heuristic
+    # ----- NAME EXTRACTION -----
     name = extract_name_with_spacy(raw_text)
-    if name:
-        extraction_methods['spacy'].append('name')
+
+    # spaCy yakalamazsa header-heuristic kullan (özellikle ALL CAPS için)
+    if not name:
+        header_text = raw_text.split("\n")[:5]  # sadece ilk satırlar
+        name = extract_name_heuristic("\n".join(header_text))
+        if name:
+            extraction_methods['regex'].append('name_heuristic')
 
     location = extract_location_with_spacy(raw_text)
     if location:
